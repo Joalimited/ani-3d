@@ -1,0 +1,21 @@
+# build output and caches
+dist/
+build/
+*.spec
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# packaged binaries and local build inputs
+*.AppImage
+*.exe
+mpv.zip
+
+# personal data that must never be committed
+*.db
+*.sqlite
+settings.json
+
+# the unused Blender model export (the app runs on its box-built models)
+tools/models.npz.unused

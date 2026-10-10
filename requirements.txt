@@ -1,0 +1,7 @@
+# Python 3.12. Pinned to the versions the AppImage / Windows builds use.
+wgpu==0.32.0
+rendercanvas==2.7.2
+glfw==2.10.2
+numpy==1.26.4
+pillow
+httpx
