@@ -397,10 +397,17 @@ class Library:
         self.app.status = {"spread": "Whole spread", "L": "Zoomed on the left page", "R": "Zoomed on the right page"}[self.focus] + "  (Z to cycle, wheel to zoom, drag to pan)"
 
     def zoom_by(self, dy):
+        if self.bv and self.bv.scrolling():  # a scroll: the wheel scrolls it (+ / - still zoom)
+            return self.bv.scroll_by(dy * 0.008)
         self.zoom = min(max(self.zoom / 1.0015 ** dy, 0.6), 4.0)
 
     def pan_by(self, dx, dy):
         s = self.app.scene.cam.dist * 0.0016
+        if self.bv and self.bv.scrolling():  # drag the paper up to read on
+            self.bv.scroll_by(-dy * s)
+            self.bv.sy = self.bv.sy_goal
+            self.pan[0] -= dx * s
+            return
         self.pan[0] -= dx * s
         self.pan[1] += dy * s
 
@@ -489,7 +496,9 @@ class Library:
         f = ease(self.pick["u"] / 0.9)
         dx, dy, dz = self.display()
         zoom = self.zoom
-        if self.focus != "spread" and self.bv:  # fit one page to the screen
+        if self.bv and self.bv.scrolling():  # a scroll is narrower than an open book: come in closer (Z: closer still)
+            zoom *= 1.25 * (1.5 if self.focus != "spread" else 1.0)
+        elif self.focus != "spread" and self.bv:  # fit one page to the screen
             dx += (1 if self.focus == "R" else -1) * (self.bv.LP / 2 + 0.03)
             zoom *= 1.9
         goal = (dx + self.pan[0], dy + self.pan[1], dz - 1.0)
@@ -781,7 +790,7 @@ class Library:
                 bv = self.bv
                 if self.kind == "manga":
                     direction = "right to left" if bv.rtl else "left to right"
-                    msg = f"arrows / A D turn page ({direction})   [ ] chapters   O list   G direction   wheel/+/- zoom   Z fit page   U hide UI   Esc close" if bv.mode == "read" else "click a chapter to read it   C continue page   Enter continue reading   G direction   wheel zoom   Esc close"
+                    msg = "wheel / W S / arrows scroll down   A D a screen at a time   [ ] chapters   O list   V read as book   +/- zoom   Z zoom width   U hide UI   Esc close" if bv.scrolling() else f"arrows / A D turn page ({direction})   [ ] chapters   O list   G direction   wheel/+/- zoom   Z fit page   U hide UI   Esc close" if bv.mode == "read" else "click a chapter to read it   C continue page   Enter continue reading   G direction   wheel zoom   Esc close"
                 else:
                     msg = "A/D or arrows flip   W/S jump 5   C continue page   click an episode to play   F star   Enter open anime   Esc close"
                 app.txt(msg, W / 2, 118, 12, th.dim, center=True)
@@ -792,7 +801,9 @@ class Library:
                                    (cx + 94, ">", lambda: bv.go(-ld)), (cx + 159, ">|" if not bv.rtl else "|<", lambda: bv.jump(bv.rtl))]:
                     app.button(lbl, x, y, 56, 34, cb)
                 lab = f"SPREAD {bv.target + 1}/{n}"
-                if bv.mode == "read":
+                if bv.scrolling():
+                    lab = f"CH {bv.chapter}  -  page {bv.strip_page()[0] + 1}/{len(bv.pages_urls)}"
+                elif bv.mode == "read":
                     lab = f"CH {bv.chapter}  -  {bv.target + 1}/{n}"
                 app.txt(lab, cx, y + 8, 14, th.text, center=True)
                 app.button("HIDE UI (U)", W - 560, y - 42, 110, 34, lambda: app.on_key("u"))
@@ -800,6 +811,8 @@ class Library:
                     app.button(lbl, W - 440 + i * 108 - (8 if i == 2 else 0), y - 42, 100 + (16 if i == 2 else 0), 34, cb)
                 if bv.manga:
                     app.button("READ: R>L" if bv.rtl else "READ: L>R", 22, y, 120, 34, lambda: bv.key("g"))
+                    if bv.mode == "read":
+                        app.button("BOOK (V)" if bv.scrolling() else "SCROLL (V)", 150, y, 110, 34, lambda: bv.key("v"))
                     bk = self.books[self.pick["i"]]
                     app.button("OPEN IN DOCUMENT READER", 22, y - 42, 232, 34, lambda: app.export_chapter(bk, bv.chapter if bv.mode == "read" else None))
                     app.button("MANGAFIRE", 22, y - 84, 120, 34, lambda: app.open_mangafire(bk["title"]))

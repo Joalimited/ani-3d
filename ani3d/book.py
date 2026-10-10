@@ -4,6 +4,9 @@ It leans back on a lectern. Pages curve down into the gutter, the stacks are mad
 looks like paper), the leaf being turned is a chain of strips whose free edge trails and settles, and the page text is
 mapped across those strips so it bends with the paper. Manga use the same engine with the binding mirrored (spine on the
 right, pages turn left to right) and image pages instead of an episode list.
+
+Long-strip chapters (manhwa / webtoons, whose pages are far taller than they are wide) are not a book at all: once the
+first pages show that shape the book becomes a hanging scroll between two wooden rollers, read by scrolling down.
 """
 import math
 from concurrent.futures import ThreadPoolExecutor
@@ -33,6 +36,10 @@ CREAM, CREAM2, RED, GOLD = (0.95, 0.91, 0.79), (0.89, 0.84, 0.71), (0.62, 0.08, 
 INK, INK_L, INK_RED = (45, 30, 20, 255), (170, 150, 125, 255), (150, 28, 22, 255)
 PER, ROWS = 24, 12  # chapters/episodes per page
 GX, GY, ROWH, COLW = 56, 150, 70, 272  # grid layout inside a 640-wide page texture
+STRIP_ASPECT = 1.8  # pages at least this much taller than wide are a long strip (manhwa / webtoon): read as a scroll
+SW, SVH = 5.4, 8.6  # scroll: paper width and the height unrolled between the rollers (world units)
+TILE_W, TILE_H = 720, 2048  # strip pages are cut into textures of at most this size
+WOOD, WOOD_D = (0.45, 0.27, 0.13), (0.30, 0.17, 0.08)
 
 
 def smooth(x):
@@ -72,6 +79,9 @@ class BookView:
         self.pending, self._cover_fut, self._placeholder = {}, None, None
         self.TM = np.eye(4)
         self._prof = {}
+        # long-strip scroll: strip = None until the first pages are measured, then True (scroll) / False (book)
+        self.strip, self.sy, self.sy_goal, self.unroll_t0, self._t = None, 0.0, 0.0, None, None
+        self.aspect, self.tiles, self.tile_pending = {}, {}, {}  # url -> height/width, url -> [(tex, world h)], url -> future
 
     # ---------- content ----------
     def eps(self):
@@ -129,6 +139,11 @@ class BookView:
         self.mode, self.chapter, self.pages_urls = "read", chapter, urls
         self.spread = self.target = 0
         self.flip = None
+        self.strip = strip_pref(self.b)  # a series already known to be a long strip opens straight into the scroll
+        self.sy = self.sy_goal = 0.0
+        self.unroll_t0 = None
+        self.tiles, self.tile_pending = {}, {}
+        self.aspect = {u: a for u, a in self.aspect.items() if u in urls}
         self.art = {k: v for k, v in self.art.items() if k[0] in ("poster",)}
         self.pending.clear()
         self.imgs = {u: i for u, i in self.imgs.items() if u in urls}
@@ -145,6 +160,7 @@ class BookView:
 
     def back_to_toc(self):
         self.mode, self.chapter, self.pages_urls = "toc", None, []
+        self.tiles, self.tile_pending = {}, {}
         self.spread = self.target = 0
         self.flip = None
         self.pending.clear()
@@ -153,6 +169,146 @@ class BookView:
     def chapter_index(self):
         eps = self.eps()
         return eps.index(self.chapter) if self.chapter in eps else -1
+
+    # ---------- long-strip scroll ----------
+    def scrolling(self):
+        return self.manga and self.mode == "read" and bool(self.strip)
+
+    def set_strip(self, on, remember=True):
+        """Switch this chapter between the scroll and the book. The choice is remembered for the series."""
+        self.strip = bool(on)
+        self.sy = self.sy_goal = 0.0
+        self.unroll_t0 = None
+        self.spread = self.target = 0
+        self.flip = None
+        if remember:
+            set_strip_pref(self.b, self.strip)
+
+    def detect_strip(self):
+        """Decide book or scroll from the shape of the first pages, once enough of them have loaded."""
+        first = self.pages_urls[:4]
+        known = [self.aspect[u] for u in first if u in self.aspect]
+        if not first or len(known) < min(2, len(first)):
+            return
+        known.sort()
+        self.set_strip(known[len(known) // 2] >= STRIP_ASPECT)
+        if self.strip:
+            self.app.status = f"Chapter {self.chapter} is a long strip (manhwa / webtoon) - it opens as a scroll: wheel, W/S or arrows to scroll down, V for the book"
+
+    def strip_heights(self):
+        """World height of every page on the scroll (pages not loaded yet use the typical shape so far)."""
+        known = sorted(self.aspect.values())
+        guess = known[len(known) // 2] if known else 3.0
+        return [self.aspect.get(u, guess) * SW for u in self.pages_urls]
+
+    def strip_page(self):
+        """Index of the page in the middle of the window, and the heights it was worked out from."""
+        hs = self.strip_heights()
+        mid, y = self.sy + SVH / 2, 0.0
+        for i, h in enumerate(hs):
+            if y + h > mid:
+                return i, hs
+            y += h
+        return max(0, len(hs) - 1), hs
+
+    def strip_max(self):
+        return max(0.0, sum(self.strip_heights()) - SVH)
+
+    def scroll_by(self, d):
+        self.sy_goal = min(max(self.sy_goal + d, 0.0), self.strip_max())
+
+    def scroll_to_page(self, i):
+        hs = self.strip_heights()
+        self.sy_goal = min(max(sum(hs[:max(0, i)]), 0.0), self.strip_max())
+
+    @staticmethod
+    def _cut_tiles(src):
+        """Worker thread: a strip page scaled to the scroll's width and cut into textures the GPU can hold."""
+        w = min(src.width, TILE_W)
+        img = src if w == src.width else src.resize((w, max(1, round(src.height * w / src.width))), Image.LANCZOS)
+        out = []
+        for y0 in range(0, img.height, TILE_H):
+            part = img.crop((0, y0, w, min(img.height, y0 + TILE_H)))
+            out.append((Renderer.build_levels(np.asarray(part.convert("RGBA")), True), part.height / w * SW))
+        return out
+
+    def strip_tiles(self, url):
+        hit = self.tiles.get(url)
+        if hit is not None:
+            return hit
+        if url in self.imgs and url not in self.tile_pending:
+            self.tile_pending[url] = _POOL.submit(self._cut_tiles, self.imgs[url])
+        return None
+
+    def poll_tiles(self, keep, budget=3):
+        for url, fut in list(self.tile_pending.items()):
+            if budget <= 0:
+                break
+            if fut.done():
+                del self.tile_pending[url]
+                try:
+                    self.tiles[url] = [(self.app.r.make_texture_levels(lv), h) for lv, h in fut.result()]
+                except Exception:  # noqa: BLE001
+                    pass
+                budget -= 1
+        for url in [u for u in self.tiles if u not in keep]:  # only the pages near the window stay on the GPU
+            del self.tiles[url]
+
+    def build_scroll(self, r, th, t, pos):
+        """The hanging scroll: paper unrolled between two wooden rollers, the strip pages laid end to end on it."""
+        dx, cy, cz = pos
+        if self.unroll_t0 is None:
+            self.unroll_t0 = t
+        a = ease((t - self.unroll_t0) / 0.9)
+        vh = max(SVH * a, 0.02)
+        cur, hs = self.strip_page()
+        total = max(sum(hs), 1e-6)
+        keep = set(self.pages_urls[max(0, cur - 3):cur + 5])
+        self.poll_tiles(keep)
+        out = []
+        top = cy + vh / 2
+        # the paper behind the art (shows while a page is still loading)
+        out.append(box(dx, cy, cz - 0.03, SW + 0.12, vh, 0.04, CREAM, 0.95, 0.0, 0.0, 0.0, 1.0))
+        y = 0.0
+        for i, (url, h) in enumerate(zip(self.pages_urls, hs)):
+            if y > self.sy + vh:
+                break
+            if y + h >= self.sy and url in keep:
+                tiles = self.strip_tiles(url)
+                if tiles:
+                    ty = y
+                    for tex, th_ in tiles:
+                        a0, a1 = max(ty, self.sy), min(ty + th_, self.sy + vh)
+                        if a1 > a0:
+                            v0, v1 = (a0 - ty) / th_, (a1 - ty) / th_
+                            r.quad3d(tex, mathx.translate(dx - SW / 2, top - (a0 - self.sy), cz + 0.001) @ mathx.scale(SW, -(a1 - a0), 1), (1, 1, 1, 1), (0, v0, 1, v1))
+                        ty += th_
+            y += h
+        # rollers: read paper winds onto the top one, unread paper waits on the bottom one, and they turn as you scroll
+        done = min(max((self.sy + vh) / total, 0.0), 1.0)
+        for side, frac in ((1, done), (-1, 1 - done)):
+            rad = 0.2 + 0.28 * frac
+            ry = top + rad if side > 0 else cy - vh / 2 - rad
+            spin = -side * self.sy / max(rad, 0.1)
+            for k in range(3):  # three rotated squares make a round-looking roll
+                out.append(box(dx, ry, cz, SW + 0.06, 2 * rad, 2 * rad, CREAM if k % 2 == 0 else CREAM2, 0.9, 0.0, 0.0, 0.0, 1.0, 0.0, spin + k * math.pi / 6))
+            for k in range(2):
+                out.append(box(dx, ry, cz, SW + 1.1, 0.3, 0.3, WOOD, 0.4, 0.0, 0.2, 0.0, 1.0, 0.0, spin + k * math.pi / 4))
+            for ex in (-1, 1):  # turned knobs on the ends
+                kx = dx + ex * (SW / 2 + 0.62)
+                out.append(box(kx, ry, cz, 0.22, 0.52, 0.52, WOOD_D, 0.4, 0.0, 0.2, 0.0, 1.0, 0.0, math.pi / 4))
+                out.append(box(kx, ry, cz, 0.22, 0.52, 0.52, GOLD, 0.8, 0.0, 0.2, 0.0, 1.0))
+        # a silk cord from the ends of the top roller up to a hook, so it reads as hanging
+        ry = top + 0.2 + 0.28 * done
+        hook = ry + 2.2
+        for ex in (-1, 1):
+            x0 = dx + ex * (SW / 2 + 0.45)
+            mx, my = (x0 + dx) / 2, (ry + hook) / 2
+            ln = math.hypot(x0 - dx, hook - ry)
+            out.append(box(mx, my, cz, 0.06, ln, 0.06, RED, 0.6, 0.0, 0.0, 0.0, 1.0, math.atan2(dx - x0, hook - ry) * -1))
+        out.append(box(dx, hook, cz, 0.3, 0.3, 0.3, GOLD, 1.0, 0.0, 0.2, 0.0, 1.0, 0.0, math.pi / 4))
+        self.geom = self.hover = None
+        return out
 
     # ---------- page art (Pillow -> mipmapped texture) ----------
     def font(self, px):
@@ -389,6 +545,22 @@ class BookView:
         return 1 if self.rtl else -1
 
     def key(self, k):
+        if k == "v" and self.manga and self.mode == "read":
+            self.set_strip(not self.strip)
+            self.app.status = "Reading as a scroll (scroll down to read)" if self.strip else "Reading as a book (turn the pages)"
+            return True
+        if self.scrolling() and k not in ("o", "g", "[", "]"):
+            step = {"ArrowDown": 1.6, "s": 1.6, "j": 1.6, "ArrowUp": -1.6, "w": -1.6, "k": -1.6, "ArrowRight": SVH * 0.85,
+                    "d": SVH * 0.85, "PageDown": SVH * 0.85, " ": SVH * 0.85, "ArrowLeft": -SVH * 0.85, "a": -SVH * 0.85, "PageUp": -SVH * 0.85}.get(k)
+            if k == "Home":
+                self.sy_goal = 0.0
+            elif k == "End":
+                self.sy_goal = self.strip_max()
+            elif step is not None:
+                self.scroll_by(step)
+            else:
+                return False
+            return True
         n = self.n_spreads() - 1
         ld = self.left_delta()
         delta = {"ArrowLeft": ld, "a": ld, "ArrowRight": -ld, "d": -ld, "ArrowUp": 5, "w": 5, "ArrowDown": -5, "s": -5, "PageDown": 5, "PageUp": -5}.get(k)
@@ -415,12 +587,39 @@ class BookView:
         return True
 
     def go(self, delta):
+        if self.scrolling():  # the screen-edge clicks and < > buttons move a window's height (left = back)
+            return self.scroll_by(SVH * 0.85 * (-delta * self.left_delta()))
         self.target = min(max(self.target + delta, 0), self.n_spreads() - 1)
 
     def jump(self, first):
+        if self.scrolling():
+            self.sy_goal = 0.0 if first == (not self.rtl) else self.strip_max()  # the left-hand button goes to the top
+            return
         self.target = 0 if first else self.n_spreads() - 1
 
     def update(self, t):
+        dt, self._t = (t - self._t if self._t is not None else 0.0), t
+        if self.mode == "read":
+            for u in self.pages_urls:
+                if u in self.imgs and u not in self.aspect:
+                    im = self.imgs[u]
+                    self.aspect[u] = im.height / max(1, im.width)
+            if self.strip is None:
+                self.detect_strip()
+        if self.scrolling():
+            self.sy_goal = min(self.sy_goal, self.strip_max())
+            self.sy += (self.sy_goal - self.sy) * (1 - math.exp(-dt * 10))
+            cur, _ = self.strip_page()
+            for i in range(max(0, cur - 2), min(len(self.pages_urls), cur + 5)):  # fetch the pages around the window ahead
+                url = self.pages_urls[i]
+                if url not in self.imgs and url not in self.requested:
+                    self.requested.add(url)
+                    self.app.fetch_page_image(url, self)
+            for i, url in enumerate(self.pages_urls):  # long chapters: let go of pages far behind or ahead
+                if abs(i - cur) > 10 and url in self.imgs:
+                    del self.imgs[url]
+                    self.requested.discard(url)
+            return
         if self.flip and t - self.flip["t0"] >= self.flip["dur"]:
             self.spread += self.flip["dir"]
             self.flip = None
@@ -526,6 +725,8 @@ class BookView:
             r.quad3d(tex, self.TM @ M, tint, uv)
 
         interactive = u >= TOTAL
+        if interactive and self.scrolling():
+            return self.build_scroll(r, th, t, pos)
         self.poll()
         self.warm(self.spread if interactive else 0)
         if interactive:
@@ -683,6 +884,22 @@ class BookView:
         base = cy - HC / 2 - 0.6
         rows.append(box(dx, base / 2 - 0.2, cz - 0.6, 1.4 * grow, max(base, 0.5), 0.9, th.wood, 0.25, 0.0, 0.3, 0.0, 1.0))
         return rows
+
+
+def strip_pref(b):
+    """Remembered book/scroll choice for a series: True, False, or None (not known yet - measure the pages)."""
+    if "_strip" not in b:
+        from .themes import load_settings
+        b["_strip"] = load_settings().get("strip_series", {}).get(str(b.get("id")))
+    return b["_strip"]
+
+
+def set_strip_pref(b, on):
+    from .themes import load_settings, save_settings
+    b["_strip"] = on
+    prefs = load_settings().get("strip_series", {})
+    prefs[str(b.get("id"))] = on
+    save_settings(strip_series=prefs)
 
 
 def _isnum(e):

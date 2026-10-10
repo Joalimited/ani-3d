@@ -26,7 +26,10 @@ from . import engine as engine_mod  # noqa: E402
 
 def _open_thumb(path, size):
     img = Image.open(path).convert("RGBA")
-    img.thumbnail(size)
+    if img.height > 1.6 * img.width:  # long-strip (webtoon) page: limit only the width, or it shrinks to a sliver
+        img.thumbnail((min(size[0], 900), 1 << 16))
+    else:
+        img.thumbnail(size)
     return img
 
 
@@ -703,7 +706,7 @@ class App:
                 book["episodes"] = book["episodes"] + [chapter]
                 book["watched"] = len(set(book["episodes"]))
             book["last"] = time.strftime("%Y-%m-%d")
-            self.status = f"Chapter {chapter}: {len(urls)} pages - " + ("right to left (left arrow = next page)" if bv.rtl else "left to right (right arrow = next page)") + ", wheel to zoom, Z fits a page"
+            self.status = f"Chapter {chapter}: {len(urls)} pages - scroll down to read (V for the book)" if bv.scrolling() else f"Chapter {chapter}: {len(urls)} pages - " + ("right to left (left arrow = next page)" if bv.rtl else "left to right (right arrow = next page)") + ", wheel to zoom, Z fits a page"
         self.be.run(core.chapter_pages(ch), self.tracked(f"Loading chapter {chapter}", done))
 
     def fetch_page_image(self, url, bv):
