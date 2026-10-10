@@ -1,6 +1,6 @@
 """Jurassic Park theme: a herd of articulated voxel dinosaurs you can poke, feed and follow.
 
-Each dinosaur is a small rig built from boxes: legs have thigh + shin + foot that swing and bend with the gait, tails and
+Each dinosaur is a small rig built from boxes: legs plant their feet on the ground and bend at the knee to reach them (two-bone IK), tails and
 necks are chains of tapering segments that sway, jaws hinge, wings flap in three parts. Boxes rotate in their own frame
 (`rollz` about the side axis, `rollx` about the forward axis), so a limb can swing about its hip.
 """
@@ -47,16 +47,72 @@ class Pose:
                 self.add(x0 + i * spacing, y, z, size, size * 1.5, size, WHITE, 0.5)
 
 
-def leg(P, ph, hx, hy, hz, thigh, shin, foot, tw, col, swing, bend, lift, dark=None, claws=True):
-    """Hip -> knee -> ankle -> foot. The thigh swings with the gait, the shin folds up when the leg is carried forward."""
-    s, c = math.sin(ph), math.cos(ph)
-    kx, ky, kz = P.seg(hx, hy, hz, thigh, -math.pi / 2 + swing * s, tw, tw * 1.0, col)
-    carry = max(0.0, c)  # the leg is on its way forward
-    ax, ay, az = P.seg(kx, ky, kz, shin, -math.pi / 2 - bend * 0.55 - swing * 0.5 * s + lift * carry, tw * 0.78, tw * 0.8, dark or col)
-    fx, fy, fz = P.seg(ax, ay, az, foot, -0.12 - lift * 0.35 * carry, tw * 0.5, tw * 1.15, dark or col)
-    if claws:
-        for dz in (-0.3, 0, 0.3):
-            P.add(fx + 0.1, fy - 0.05, fz + dz * tw, tw * 0.45, tw * 0.22, tw * 0.22, WHITE, 0.5)
+STRIDE = 0.6 * math.tau / (1.24 * SCALE)  # stride (local units) that keeps a planted foot still while the body walks over it
+STANCE = 0.6  # share of the gait cycle a foot spends on the ground
+
+
+def gait(ph, mv, hip_h, lift):
+    """Where the foot is along the body (offset from the hip) and how high it is lifted, at gait phase `ph`. On the
+    ground the foot slides back exactly as fast as the body moves forward, so it stays planted; then it swings forward."""
+    stride = min(STRIDE, hip_h) * mv
+    u = (ph / math.tau) % 1.0
+    if u < STANCE:
+        return stride * (0.5 - u / STANCE), 0.0, 0.0
+    v = (u - STANCE) / (1 - STANCE)
+    up = math.sin(math.pi * v)
+    return stride * (-0.5 + smooth(v)), lift * hip_h * mv * up, up * mv
+
+
+def ik(hx, hy, ax, ay, l1, l2, knee):
+    """Two-bone leg in the side plane: angles of the upper and lower bone that put the joint end on (ax, ay).
+    knee=+1 bends the joint forward (bird / hind leg), -1 backward (elbow)."""
+    dx, dy = ax - hx, ay - hy
+    d = min(max(math.hypot(dx, dy), abs(l1 - l2) + 1e-3), l1 + l2 - 1e-3)
+    base = math.atan2(dy, dx)
+    a = math.acos(min(1.0, max(-1.0, (l1 * l1 + d * d - l2 * l2) / (2 * l1 * d))))
+    a1 = base + knee * a
+    kx, ky = hx + l1 * math.cos(a1), hy + l1 * math.sin(a1)
+    return a1, math.atan2(ay - ky, ax - kx)
+
+
+def leg(P, ph, mv, hx, hy, hz, tw, col, dark=None, biped=True, knee=1, claws=True, sickle=False, lift=0.22):
+    """A leg whose foot really stands on the ground (y=0).
+    Biped (theropod / hadrosaur): thigh -> shin -> raised ankle bone -> three toes flat on the ground, claws at the tips.
+    Quadruped: a near-straight column onto a round pad with blunt nails."""
+    dark = dark or col
+    off, up, swing = gait(ph, mv, hy, lift)
+    if biped:
+        meta, toe = 0.3 * hy, 0.26 * hy
+        l1, l2 = 0.44 * hy, 0.4 * hy
+        bx, by = hx + off - 0.05 * hy, up  # where the toes start
+        lean = 0.42 + 0.5 * swing  # the ankle bone leans back, more while the foot is carried
+        ax, ay = bx - meta * math.sin(lean), by + meta * math.cos(lean)
+        a1, a2 = ik(hx, hy, ax, ay, l1, l2, knee)
+        kx, ky, kz = P.seg(hx, hy, hz, l1, a1, tw, tw, col)
+        P.seg(kx, ky, kz, l2, a2, tw * 0.72, tw * 0.75, dark)
+        P.seg(ax, ay, hz, meta, -math.pi / 2 + lean, tw * 0.45, tw * 0.5, dark)
+        P.add(bx, by + tw * 0.12, hz, tw * 0.5, tw * 0.42, tw * 0.6, dark)  # the ball of the foot
+        tth = tw * 0.24
+        droop = -0.5 * swing  # toes curl down a little in the air
+        for k, psi in enumerate((-0.38, 0.0, 0.38)):
+            ln = toe * (1.0 if k == 1 else 0.78)
+            ex, ey, ez = P.seg(bx, by + tth / 2, hz, ln, droop, tth, tth * 1.1, dark, 0.25, psi)
+            if claws:
+                P.seg(ex - 0.03, ey, ez, tw * 0.32, droop - 0.6, tth * 0.7, tth * 0.6, WHITE, 0.5, psi)
+        if sickle:  # the raptor's killing claw, held up off the ground on the second toe
+            P.seg(bx + 0.05, by + tth, hz, tw * 0.75, 1.0, tth * 0.8, tth * 0.6, WHITE, 0.8)
+    else:
+        pad = tw * 0.32
+        l1 = l2 = (hy - pad) * 0.53
+        ax, ay = hx + off, up + pad
+        a1, a2 = ik(hx, hy, ax, ay, l1, l2, knee)
+        kx, ky, kz = P.seg(hx, hy, hz, l1, a1, tw, tw, col)
+        P.seg(kx, ky, kz, l2, a2, tw * 0.82, tw * 0.85, dark)
+        P.add(ax, up + pad / 2, hz, tw * 1.05, pad, tw * 1.05, dark)
+        P.add(ax, up + pad / 2, hz, tw * 0.75, pad * 1.01, tw * 1.25, dark, 0.25, 0.0, 0.0, math.pi / 4)  # rounder pad
+        if claws:
+            for dz in (-0.32, 0.0, 0.32):
+                P.add(ax + tw * 0.5, up + pad * 0.4, hz + dz * tw, tw * 0.18, pad * 0.7, tw * 0.2, WHITE, 0.5)
 
 
 def tail(P, t, x, y, n, length, thick0, thick1, col, belly=None, sway=0.25, droop=0.06, lag=0.0, wave=2.2, wid_k=1.0):
@@ -102,9 +158,8 @@ def rig_trex(P, st, pal):
         P.seg(2.9, hy + 0.2, sz * 1.15, 0.9, -0.9 - 0.3 * math.sin(t * 2), 0.38, 0.38, back)
         P.seg(3.4, hy - 0.5, sz * 1.15, 0.7, -1.5, 0.3, 0.3, belly)
     tail(P, t, -2.0, hy + 0.8, 9, 1.35, 2.0, 0.35, back, belly, 0.28, 0.03, st["turn"])
-    amp = 0.62 * (0.4 + 0.6 * mv)
     for k, sz in enumerate((-1, 1)):
-        leg(P, ph + k * math.pi, 0.1, hy - 0.25, sz * 1.15, 2.35, 2.2, 1.7, 1.25, back, amp * mv, 0.5, 0.9, belly)
+        leg(P, ph + k * math.pi, mv, 0.1, hy - 0.25, sz * 1.15, 1.25, back, belly)
 
 
 def rig_trike(P, st, pal):
@@ -127,9 +182,8 @@ def rig_trike(P, st, pal):
     P.seg(hx + 1.6, hyd + 0.3, 0, 0.9, 0.9, 0.5, 0.5, WHITE, 0.6)
     P.eye(hx + 0.6, hyd + 0.5, 0, 0.3)
     tail(P, t, -3.0, hy + 1.0, 4, 1.2, 1.6, 0.5, back, belly, 0.18)
-    amp = 0.45 * mv
     for (lx, sz, off) in ((1.9, -1, 0.0), (1.9, 1, math.pi), (-1.9, -1, math.pi), (-1.9, 1, 0.0)):
-        leg(P, ph + off, lx, hy - 0.2, sz * 1.25, 1.6, 1.5, 0.9, 1.15, back, amp, 0.3, 0.5, belly, claws=False)
+        leg(P, ph + off, mv, lx, hy - 0.2, sz * 1.25, 1.15, back, belly, biped=False, knee=-1 if lx > 0 else 1)
 
 
 def rig_brachio(P, st, pal):
@@ -143,9 +197,8 @@ def rig_brachio(P, st, pal):
     P.add(nx + 1.6, ny - 0.15, nz, 0.9, 0.7, 0.9, belly, 0.3, -0.2, 0.0, look)
     P.eye(nx + 0.9, ny + 0.4, nz, 0.26)
     tail(P, t, -3.1, hy + 1.2, 9, 1.6, 2.0, 0.4, back, belly, 0.3, 0.1, st["turn"], 1.6)
-    amp = 0.38 * mv
     for (lx, sz, off) in ((2.2, -1, 0.0), (2.2, 1, math.pi), (-2.2, -1, math.pi), (-2.2, 1, 0.0)):
-        leg(P, ph + off, lx, hy - 0.3, sz * 1.3, 3.3, 3.2, 1.3, 1.5, back, amp, 0.2, 0.3, belly, claws=False)
+        leg(P, ph + off, mv, lx, hy - 0.3, sz * 1.3, 1.5, back, belly, biped=False, knee=-1 if lx > 0 else 1, lift=0.1)
 
 
 def rig_stego(P, st, pal):
@@ -173,9 +226,8 @@ def rig_stego(P, st, pal):
     for k in range(4):  # the thagomizer
         sz = -1 if k % 2 == 0 else 1
         P.seg(tx - 0.2 - 0.25 * (k // 2), ty, tz + sz * 0.3, 1.7, 0.5 + 0.25 * (k // 2) if sz > 0 else 0.5, 0.28, 0.28, WHITE, 0.7, sz * (0.35 + 0.1 * (k // 2)))
-    amp = 0.4 * mv
-    for (lx, sz, off, ln) in ((1.9, -1, 0.0, 1.5), (1.9, 1, math.pi, 1.5), (-1.9, -1, math.pi, 1.9), (-1.9, 1, 0.0, 1.9)):
-        leg(P, ph + off, lx, hy - 0.15, sz * 1.25, ln, ln, 0.8, 0.95, back, amp, 0.25, 0.4, belly, claws=False)
+    for (lx, sz, off, drop) in ((1.9, -1, 0.0, 0.5), (1.9, 1, math.pi, 0.5), (-1.9, -1, math.pi, 0.0), (-1.9, 1, 0.0, 0.0)):
+        leg(P, ph + off, mv, lx, hy - 0.15 - drop, sz * 1.25, 0.95, back, belly, biped=False, knee=-1 if lx > 0 else 1)  # short front legs
 
 
 def rig_raptor(P, st, pal):
@@ -196,10 +248,8 @@ def rig_raptor(P, st, pal):
     for k in range(3):  # head crest of feathers
         P.seg(nx - 0.3, ny + 0.4, nz, 0.7, 0.8 + 0.3 * k, 0.12, 0.16, acc, 0.6, (k - 1) * 0.2)
     tail(P, t, -1.3, hy + 0.4, 8, 0.85, 0.6, 0.12, back, acc, 0.12, 0.0, st["turn"], 3.0)
-    amp = 0.9 * (0.3 + 0.7 * mv)
     for k, sz in enumerate((-1, 1)):
-        leg(P, ph + k * math.pi, 0.1, hy - 0.1, sz * 0.5, 1.25, 1.3, 0.95, 0.5, back, amp * mv, 0.7, 1.1, belly)
-        P.add(0.5, 0.15, sz * 0.5, 0.65, 0.12, 0.12, WHITE, 0.8, -0.7)  # sickle claw
+        leg(P, ph + k * math.pi, mv, 0.1, hy - 0.1, sz * 0.5, 0.5, back, belly, sickle=True, lift=0.3)
 
 
 def rig_anky(P, st, pal):
@@ -224,9 +274,8 @@ def rig_anky(P, st, pal):
         psi = 0.35 * math.sin(t * 1.8 - i * 0.8) * (i + 1) / 3 + st["turn"] * (i + 1) / 3
         tx, ty, tz = P.seg(tx, ty, tz, 1.5, -math.pi - 0.02, 1.2 - i * 0.2, 1.8 - i * 0.4, back, 0.25, psi)
     P.add(tx - 0.9, ty, tz + 0.35 * math.sin(t * 1.8 - 2.4), 1.6, 1.4, 2.0, acc, 0.6)  # the club
-    amp = 0.35 * mv
     for (lx, sz, off) in ((1.8, -1, 0.0), (1.8, 1, math.pi), (-1.8, -1, math.pi), (-1.8, 1, 0.0)):
-        leg(P, ph + off, lx, hy - 0.3, sz * 1.5, 1.0, 1.0, 0.8, 1.0, back, amp, 0.2, 0.3, belly, claws=False)
+        leg(P, ph + off, mv, lx, hy - 0.3, sz * 1.5, 1.0, back, belly, biped=False, knee=-1 if lx > 0 else 1, lift=0.18)
 
 
 def rig_para(P, st, pal):
@@ -245,16 +294,17 @@ def rig_para(P, st, pal):
     for sz in (-1, 1):
         P.seg(2.0, hy + 0.5, sz * 1.05, 1.1, -0.9, 0.4, 0.4, back)
     tail(P, t, -2.1, hy + 0.7, 7, 1.25, 1.3, 0.3, back, belly, 0.2, 0.05, st["turn"], 2.0)
-    amp = 0.5 * mv
     for k, sz in enumerate((-1, 1)):
-        leg(P, ph + k * math.pi, 0.0, hy - 0.2, sz * 0.9, 1.9, 1.9, 1.3, 1.0, back, amp * mv, 0.5, 0.8, belly)
+        leg(P, ph + k * math.pi, mv, 0.0, hy - 0.2, sz * 0.9, 1.0, back, belly, claws=False)  # hadrosaur: blunt hoof-like toes
 
 
 def rig_ptero(P, st, pal):
     back, belly, acc = pal
     t = st["t"]
-    flap = math.sin(t * st["flap"]) * 0.75
-    bob = 0.25 * math.sin(t * st["flap"])
+    beat = math.sin(t * st["flap"])
+    glide = 0.35 + 0.65 * smooth(0.5 + 0.5 * math.sin(t * 0.7 + st.get("seed", 0.0)))  # flaps in bursts, glides in between
+    flap = beat * 0.5 * glide - 0.05
+    bob = 0.25 * beat * glide
     P.add(0, bob, 0, 2.2, 0.8, 0.9, back, 0.3)
     P.add(0, bob - 0.15, 0, 1.8, 0.4, 0.8, belly, 0.3)
     P.add(1.5, bob + 0.2, 0, 1.0, 0.7, 0.7, back, 0.3, 0.2)
@@ -265,7 +315,7 @@ def rig_ptero(P, st, pal):
     for sz in (-1, 1):  # three wing segments: each one tilts a little more than the one before, so the wing bends as it flaps
         x, y, z = 0.2, bob + 0.2, sz * 0.4
         for k, (ln, wd) in enumerate(((1.9, 2.0), (2.5, 1.6), (2.6, 1.1))):
-            phi = flap * (1.0 + 0.45 * k) + (0.1 if k else 0.0)  # elevation: up is positive, both wings flap together
+            phi = flap * (1.0 + 0.3 * k) + 0.06 * k  # elevation: up is positive, both wings flap together
             dy, dz = math.sin(phi), sz * math.cos(phi)
             P.parts.append((x - 0.15 * k, y + dy * ln / 2, z + dz * ln / 2, wd, 0.12, ln, acc if k == 2 else back, 0.35, 0.0, -sz * phi, 0.0))
             y, z = y + dy * ln, z + dz * ln
@@ -502,7 +552,7 @@ class Herd:
             roar_u = (t - d.roar_t0) / 1.7
             roar = math.sin(math.pi * roar_u) ** 0.6 if 0 <= roar_u <= 1 else 0.0
             graze = d.graze + (0.0 if d.eat_until <= t else 0.15 * math.sin(t * 7))  # chewing
-            st = {"t": t, "ph": d.phase * 2, "mv": d.mv, "roar": roar, "look": d.look, "graze": graze, "turn": d.turn, "flap": d.flap}
+            st = {"t": t, "ph": d.phase * 2, "mv": d.mv, "roar": roar, "look": d.look, "graze": graze, "turn": d.turn, "flap": d.flap, "seed": d.i * 1.7}
             P = Pose()
             RIGS[d.kind](P, st, d.pal)
             c, s = math.cos(d.heading), math.sin(d.heading)
