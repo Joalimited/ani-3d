@@ -5,6 +5,7 @@ build/
 __pycache__/
 *.pyc
 .venv/
+.tools/
 venv/
 
 # packaged binaries and local build inputs

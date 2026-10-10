@@ -30,20 +30,32 @@ Runs on Linux and Windows with any GPU that supports Vulkan or Direct3D 12.
 `ani-3d.exe` is a single file with mpv bundled inside - just double-click it. It needs Windows 10 or newer and a graphics
 driver with Direct3D 12 or Vulkan.
 
-### From source (any OS)
+### From source (Linux)
 
-You need **Python 3.12** and **mpv** on your `PATH`.
+Install **mpv**, then clone and run:
 
 ```sh
 git clone https://github.com/Joalimited/ani-3d.git
 cd ani-3d
+./ani-3d
+```
+
+The first run sets itself up (about a minute): it makes a Python 3.12 environment in `.venv` and installs the packages.
+If Python 3.12 isn't installed, it uses [uv](https://github.com/astral-sh/uv) to download it. After that `./ani-3d`
+starts straight away.
+
+### From source (Windows / manual)
+
+You need **Python 3.12** and **mpv** on your `PATH`.
+
+```sh
 python3.12 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+.venv\Scripts\activate            # Linux: source .venv/bin/activate
 pip install -r requirements.txt
 python run.py
 ```
 
-Not sure everything is set up? `python run.py --check` runs a self-check (graphics adapter, sources, mpv, fonts) and
+Not sure everything is set up? `./ani-3d --check` (or `python run.py --check`) runs a self-check (graphics adapter, sources, mpv, fonts) and
 prints what works and what doesn't.
 
 ## First steps

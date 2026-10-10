@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Run ani-3d from a git checkout: ./ani-3d (any arguments go to run.py, e.g. ./ani-3d --check).
+# The first run makes a Python 3.12 environment in .venv and installs requirements.txt; later runs start straight away
+# and only reinstall when requirements.txt changes.
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+
+VENV=.venv
+say() { printf '\033[1;36mani-3d:\033[0m %s\n' "$*"; }
+die() { printf '\033[1;31mani-3d:\033[0m %s\n' "$*" >&2; exit 1; }
+
+if ! command -v mpv >/dev/null 2>&1; then
+    die "mpv is needed to play episodes. Install it first, e.g.
+    sudo dnf install mpv        # Fedora
+    sudo apt install mpv        # Debian / Ubuntu
+    sudo pacman -S mpv          # Arch"
+fi
+
+# Find uv: on PATH, or one this script installed earlier.
+find_uv() {
+    if command -v uv >/dev/null 2>&1; then command -v uv
+    elif [ -x .tools/bin/uv ]; then echo .tools/bin/uv
+    fi
+}
+
+make_venv() {
+    rm -rf "$VENV"
+    if command -v python3.12 >/dev/null 2>&1; then
+        say "creating the Python 3.12 environment"
+        python3.12 -m venv "$VENV"
+        return
+    fi
+    local uv
+    uv=$(find_uv)
+    if [ -z "$uv" ]; then
+        command -v python3 >/dev/null 2>&1 || die "Python 3 is not installed. Install python3 (or python3.12) and run ./ani-3d again."
+        say "Python 3.12 not found - installing uv (a Python manager) into .tools to fetch it"
+        python3 -m venv .tools || die "could not create a Python environment. Install python3-venv (or python3.12) and run ./ani-3d again."
+        .tools/bin/pip install --quiet --disable-pip-version-check uv
+        uv=.tools/bin/uv
+    fi
+    say "creating the Python 3.12 environment (uv downloads Python 3.12 if needed)"
+    "$uv" venv --quiet --seed --python 3.12 "$VENV"
+}
+
+if ! "$VENV/bin/python" -c 'import sys; sys.exit(sys.version_info[:2] != (3, 12))' 2>/dev/null; then
+    make_venv
+fi
+
+want=$(sha256sum requirements.txt | cut -d' ' -f1)
+if [ "$(cat "$VENV/.requirements.sha256" 2>/dev/null)" != "$want" ]; then
+    say "installing the Python packages (one time, about a minute)"
+    "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check -r requirements.txt
+    echo "$want" > "$VENV/.requirements.sha256"
+fi
+
+exec "$VENV/bin/python" run.py "$@"
