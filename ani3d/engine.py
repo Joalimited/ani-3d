@@ -36,6 +36,7 @@ class Engine:
         self.skip = {}  # {"intro": (start, end), "outro": (start, end)} from the stream config, when it has one
         self.poster = ""
         self.source = ""
+        self._late_sub = ""  # subtitle to add once the video is open (see play)
         self._resume_at = 0.0  # last time the watch position was written to the database
 
     # ----- io -----
@@ -225,7 +226,10 @@ class Engine:
         if self.autofs:
             args.append("--fullscreen")
         args += os.environ.get("ANI3D_MPV_ARGS", "").split()  # extra mpv options (used by the headless self-tests)
-        if sub:
+        self._late_sub = ""
+        if sub and "m3u8" in video:  # the forced hls format would also apply to --sub-file, so mpv could not read the .vtt
+            self._late_sub = sub
+        elif sub:
             args.append(f"--sub-file={sub}")
         if start:
             args.append(f"--start={int(start)}")
@@ -264,6 +268,10 @@ class Engine:
                             self.save_resume()
                         if m["name"] in ("time-pos", "chapter-list") and token == self.token:
                             await self.auto_skip()
+                        if m["name"] == "duration" and m.get("data") and self._late_sub and token == self.token:
+                            sub, self._late_sub = self._late_sub, ""
+                            await self.mpv("set_property", "demuxer-lavf-format", "")
+                            await self.mpv("sub-add", sub, "select")
                     elif m.get("event") == "end-file" and m.get("reason") == "eof":
                         self.eof = True
                         if token == self.token:
